@@ -6,11 +6,20 @@ from src.models.pipelines.cl4d_module.cl4d_pipeline import CL4D
 class CL4DGrounding(CL4D):
     """Run CL4D windows and retain the complete ViT token sequence."""
 
-    def __init__(self, *args, grounding_window_size: int = 32, **kwargs):
+    def __init__(
+        self,
+        *args,
+        grounding_window_size: int = 32,
+        window_batch_size: int = 1,
+        **kwargs,
+    ):
         kwargs["num_frames"] = grounding_window_size
         kwargs["feature_mode"] = "all"
         super().__init__(*args, **kwargs)
         self.grounding_window_size = grounding_window_size
+        if window_batch_size < 1:
+            raise ValueError("window_batch_size must be positive.")
+        self.window_batch_size = window_batch_size
         grid_size = getattr(self.motion_encoder.model.patch_embed, "grid_size", None)
         if grid_size is None:
             raise ValueError("The configured motion encoder does not expose a patch grid.")
@@ -72,7 +81,10 @@ class CL4DGrounding(CL4D):
             points,
             features,
         )
-        window_tokens = super().encode_motion(windows)
+        token_chunks = []
+        for window_batch in windows.split(self.window_batch_size, dim=0):
+            token_chunks.append(CL4D.encode_motion(self, window_batch))
+        window_tokens = torch.cat(token_chunks, dim=0)
         if window_tokens.ndim != 3:
             raise ValueError(
                 "CL4D grounding requires feature_mode='all' to return "

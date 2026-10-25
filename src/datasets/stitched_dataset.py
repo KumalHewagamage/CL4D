@@ -1,6 +1,7 @@
 import json
 import logging
 import random
+from collections import OrderedDict
 import math
 import numpy as np
 import torch
@@ -22,15 +23,16 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
         self.sampled_frames = config["sampled_frames"]
         self.stride = config["stride"]
         self.num_points = config["num_points"]
+        self.num_features = config.get("num_features", 3)
         self.window_size = config["window_size"]
         self.no_normalize = config.get("no_normalize", False)
         self.augment = config.get("augment", False)
         self.seed = config.get("seed", 42)
+        self.sequence_cache_size = config.get("sequence_cache_size", 1)
+        self._sequence_cache = OrderedDict()
         
         random.seed(self.seed)
         np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-
         self.samples = self._build_flattened_index()
         logger.info(f"Dataset initialized with {len(self.samples)} query-video pairs.")
 
@@ -57,7 +59,7 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
         return flattened_samples
 
     def _load_pcd(self, pcd_path: str) -> np.ndarray:
-        points, colors, normals = [], [], []
+        points = []
         try:
             with open(pcd_path, 'r') as f:
                 lines = f.readlines()
@@ -68,41 +70,29 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
                     header_end = i + 1
                     break
                     
-            default_color, default_normal = [0.5, 0.5, 0.5], [0.0, 0.0, 0.0]
             for line in lines[header_end:]:
                 parts = line.strip().split()
                 if len(parts) < 3: continue
                 
                 points.append([float(parts[0]), float(parts[1]), float(parts[2])])
                 
-                n = [float(parts[3]), float(parts[4]), float(parts[5])] if len(parts) >= 6 else default_normal
-                normals.append(n)
-                
-                c = default_color
-                if len(parts) >= 7:
-                    try:
-                        packed_rgb = int(float(parts[6]))
-                        c = [((packed_rgb >> 16) & 255) / 255.0, 
-                             ((packed_rgb >> 8) & 255) / 255.0, 
-                             (packed_rgb & 255) / 255.0]
-                    except: pass
-                colors.append(c)
-
             pts = np.array(points, dtype=np.float32)
-            cols = np.array(colors, dtype=np.float32)
-            nrms = np.array(normals, dtype=np.float32)
-            if len(pts) == 0: return np.zeros((0, 9), dtype=np.float32)
-            return np.concatenate([pts, cols, nrms], axis=1)
+            if len(pts) == 0:
+                return np.zeros((0, self.num_features), dtype=np.float32)
+            return pts
         except Exception:
-            return np.zeros((0, 9), dtype=np.float32)
+            return np.zeros((0, self.num_features), dtype=np.float32)
 
     def _process_points(self, point_data: np.ndarray) -> np.ndarray:
         N, T = point_data.shape[0], self.num_points
-        if N == 0: return np.zeros((T, 9), dtype=np.float32)
+        if N == 0: return np.zeros((T, self.num_features), dtype=np.float32)
         if N >= T:
             indices = np.random.choice(N, T, replace=False)
-            return point_data[indices]
-        return np.concatenate([point_data, np.zeros((T - N, 9), dtype=np.float32)], axis=0)
+            return point_data[indices, :self.num_features]
+        return np.concatenate([
+            point_data[:, :self.num_features],
+            np.zeros((T - N, self.num_features), dtype=np.float32)
+        ], axis=0)
 
     def _load_and_stitch_frames(self, actions: List[Dict]) -> np.ndarray:
         """Loads physical frames and aligns their roots (X, Z) sequentially."""
@@ -141,7 +131,9 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
         if stitched_frames:
             full_sequence = np.concatenate(stitched_frames, axis=0)
         else:
-            full_sequence = np.zeros((1, self.num_points, 9), dtype=np.float32)
+            full_sequence = np.zeros(
+                (1, self.num_points, self.num_features), dtype=np.float32
+            )
             
         # Pad by repeating the last frame if it falls short of the target raw frames
         current_len = full_sequence.shape[0]
@@ -150,6 +142,20 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
             full_sequence = np.concatenate([full_sequence, padding], axis=0)
             
         return full_sequence[:self.target_raw_frames]
+
+    def _get_stitched_sequence(self, sample):
+        stitched_id = sample["stitched_id"]
+        cached = self._sequence_cache.get(stitched_id)
+        if cached is not None:
+            self._sequence_cache.move_to_end(stitched_id)
+            return cached
+        sequence = self._load_and_stitch_frames(sample["seq_meta"]["actions"])
+        if self.sequence_cache_size > 0:
+            self._sequence_cache[stitched_id] = sequence
+            self._sequence_cache.move_to_end(stitched_id)
+            while len(self._sequence_cache) > self.sequence_cache_size:
+                self._sequence_cache.popitem(last=False)
+        return sequence
 
     def _chunked_normalization(self, seq_data: np.ndarray) -> np.ndarray:
         """Normalizes spatial coordinates strictly within 32-frame blocks."""
@@ -176,7 +182,7 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
         caption = target_action["caption"]
         
         # 1. Load, stitch, and pad raw frames [320, N, 9]
-        raw_sequence = self._load_and_stitch_frames(seq_meta["actions"])
+        raw_sequence = self._get_stitched_sequence(sample)
         
         # 2. Strided temporal sampling [160, N, 9]
         sampled_sequence = raw_sequence[::self.stride][:self.sampled_frames]

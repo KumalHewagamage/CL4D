@@ -37,6 +37,8 @@ class FourDGroundingModel(nn.Module):
     def set_encoder_trainable(self, trainable: bool) -> None:
         for parameter in self.encoder.parameters():
             parameter.requires_grad = trainable
+        if not trainable:
+            self.encoder.eval()
 
     def forward(
         self,
@@ -49,7 +51,14 @@ class FourDGroundingModel(nn.Module):
             raise AttributeError(
                 "The configured 4D encoder must expose an encode_motion method."
             )
-        video_tokens = self.encoder.encode_motion(motion)
+        encoder_trainable = any(
+            parameter.requires_grad for parameter in self.encoder.parameters()
+        )
+        if encoder_trainable:
+            video_tokens = self.encoder.encode_motion(motion)
+        else:
+            with torch.no_grad():
+                video_tokens = self.encoder.encode_motion(motion)
         text_tokens = self.text_encoder(input_ids, attention_mask)
         if video_padding_mask is None:
             video_mask = torch.ones(

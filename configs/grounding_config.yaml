@@ -7,6 +7,7 @@ model:
   encoder_checkpoint_path: "weights/cl4d/best.pth"
   encoder_wrapper_module: "src.models.pipelines.cl4d_module.cl4d_pipeline_grounding"
   encoder_wrapper_class: "CL4DGrounding"
+  encoder_window_batch_size: 1
   grounding:
     text_model_name: "distilbert-base-uncased"
     load_text_encoder_from_checkpoint: true
@@ -39,8 +40,9 @@ model:
     contrastive_align_loss_coef: 1.0
     temperature: 0.07
     lw_saliency: 0.0
+    compute_saliency: false
     saliency_margin: 0.2
-  freeze_encoder: ture
+  freeze_encoder: true
   freeze_encoder_during_warmup: false
   warmup_epochs: 0
 

@@ -25,7 +25,8 @@ class QDDETR(nn.Module):
     def __init__(self, transformer, position_embed, txt_position_embed, txt_dim, vid_dim,
                  num_queries, input_dropout, aux_loss=False,
                  contrastive_align_loss=False, contrastive_hdim=64,
-                 max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2, aud_dim=0):
+                 max_v_l=75, span_loss_type="l1", use_txt_pos=False, n_input_proj=2,
+                 aud_dim=0, compute_saliency=True):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -82,6 +83,7 @@ class QDDETR(nn.Module):
         self.saliency_proj1 = nn.Linear(hidden_dim, hidden_dim)
         self.saliency_proj2 = nn.Linear(hidden_dim, hidden_dim)
         self.aux_loss = aux_loss
+        self.compute_saliency = compute_saliency
 
         self.hidden_dim = hidden_dim
         self.global_rep_token = torch.nn.Parameter(torch.randn(hidden_dim))
@@ -155,6 +157,15 @@ class QDDETR(nn.Module):
         if src_txt.shape[1] == 0:
             print("There is zero text query. You should change codes properly")
             exit(-1)
+
+        if not self.compute_saliency:
+            out["video_mask"] = src_vid_mask
+            if self.aux_loss:
+                out["aux_outputs"] = [
+                    {"pred_logits": a, "pred_spans": b}
+                    for a, b in zip(outputs_class[:-1], outputs_coord[:-1])
+                ]
+            return out
 
         ### Neg Pairs ###
         src_txt_neg = torch.cat([src_txt[1:], src_txt[0:1]], dim=0)
@@ -538,6 +549,7 @@ def build_model(args):
             span_loss_type=args.span_loss_type,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
+            compute_saliency=getattr(args, "compute_saliency", True),
         )
     else:
         model = QDDETR(
@@ -555,6 +567,7 @@ def build_model(args):
             span_loss_type=args.span_loss_type,
             use_txt_pos=args.use_txt_pos,
             n_input_proj=args.n_input_proj,
+            compute_saliency=getattr(args, "compute_saliency", True),
         )
 
     matcher = build_matcher(args)
@@ -571,7 +584,9 @@ def build_model(args):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items() if k != "loss_saliency"})
         weight_dict.update(aux_weight_dict)
 
-    losses = ['spans', 'labels', 'saliency']
+    losses = ['spans', 'labels']
+    if getattr(args, "compute_saliency", True):
+        losses.append("saliency")
     if args.contrastive_align_loss:
         losses += ["contrastive_align"]
         

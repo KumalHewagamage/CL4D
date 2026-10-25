@@ -39,6 +39,9 @@ def load_4d_encoder(config, device):
     module = importlib.import_module(pipeline_config["pipeline_module"])
     encoder_class = getattr(module, pipeline_config["pipeline_class"])
     encoder_args = dict(pipeline_config.get("pipeline_args", {}))
+    encoder_args["window_batch_size"] = config["model"].get(
+        "encoder_window_batch_size", encoder_args.get("window_batch_size", 1)
+    )
     if "feature_mode" in inspect.signature(encoder_class).parameters:
         encoder_args["feature_mode"] = "all"
     wrapper_module_name = config["model"].get("encoder_wrapper_module")
@@ -134,6 +137,7 @@ def build_grounding_model(config, device):
             "v_feat_dim": encoder_dim,
             "max_v_l": qd_args_video_tokens,
             "aux_loss": grounding_config.get("aux_loss", True),
+            "compute_saliency": grounding_config.get("compute_saliency", False),
         }
     )
     # QD-DETR's transformer builder expects this CLI-style option even when
@@ -216,7 +220,8 @@ def prepare_batch(batch, tokenizer, device, max_q_l):
     # QD-DETR expects a single dictionary where keys map to a list of target dicts for the batch
     formatted_targets = {
         "span_labels": [
-            {"spans": t["span_labels"][0]["spans"].to(device)} for t in targets
+            {"spans": t["span_labels"][0]["spans"].to(device, non_blocking=True)}
+            for t in targets
         ]
     }
     
@@ -231,10 +236,50 @@ def prepare_batch(batch, tokenizer, device, max_q_l):
     )
 
 
+def temporal_iou(pred_spans, target_spans):
+    pred_start = (pred_spans[:, 0] - pred_spans[:, 1] / 2).clamp(0, 1)
+    pred_end = (pred_spans[:, 0] + pred_spans[:, 1] / 2).clamp(0, 1)
+    target_start = (target_spans[:, 0] - target_spans[:, 1] / 2).clamp(0, 1)
+    target_end = (target_spans[:, 0] + target_spans[:, 1] / 2).clamp(0, 1)
+    intersection = (
+        torch.minimum(pred_end, target_end)
+        - torch.maximum(pred_start, target_start)
+    ).clamp_min(0)
+    union = (
+        (pred_end - pred_start)
+        + (target_end - target_start)
+        - intersection
+    ).clamp_min(1e-8)
+    return intersection / union
+
+
+def grounding_metrics(outputs, targets):
+    with torch.no_grad():
+        foreground_scores = outputs["pred_logits"].softmax(-1)[..., 0]
+        best_indices = foreground_scores.argmax(dim=1)
+        batch_indices = torch.arange(
+            foreground_scores.shape[0], device=foreground_scores.device
+        )
+        predictions = outputs["pred_spans"][batch_indices, best_indices]
+        ground_truth = torch.cat(
+            [target["spans"][:1] for target in targets["span_labels"]], dim=0
+        ).to(predictions.device)
+        ious = temporal_iou(predictions, ground_truth)
+        return {
+            "mean_iou": ious.mean().item(),
+            "recall_iou_0.3": (ious >= 0.3).float().mean().item(),
+            "recall_iou_0.5": (ious >= 0.5).float().mean().item(),
+            "recall_iou_0.7": (ious >= 0.7).float().mean().item(),
+        }
+
+
 def run_epoch(model, criterion, loader, optimizer, tokenizer, config, device, train):
     model.train(train)
+    if not any(parameter.requires_grad for parameter in model.encoder.parameters()):
+        model.encoder.eval()
     criterion.train(train)
     total_loss = 0.0
+    metric_totals = {}
     for batch in tqdm(loader, desc="train" if train else "val"):
         inputs, targets = prepare_batch(
             batch, tokenizer, device, config["model"]["grounding"]["max_q_l"]
@@ -247,15 +292,21 @@ def run_epoch(model, criterion, loader, optimizer, tokenizer, config, device, tr
                 for key in loss_dict
                 if key in criterion.weight_dict
             )
+            batch_metrics = grounding_metrics(outputs, targets)
             if train:
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 losses.backward()
                 clip = config["training"].get("gradient_clipping")
                 if clip:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
                 optimizer.step()
         total_loss += losses.detach().item()
-    return total_loss / max(len(loader), 1)
+        for name, value in batch_metrics.items():
+            metric_totals[name] = metric_totals.get(name, 0.0) + value
+    divisor = max(len(loader), 1)
+    return total_loss / divisor, {
+        name: value / divisor for name, value in metric_totals.items()
+    }
 
 
 def main():
@@ -271,16 +322,15 @@ def main():
     train_dataset, collate_fn = build_dataset(config, config["data"]["train_split"])
     val_dataset, _ = build_dataset(config, config["data"]["val_split"])
     
-    # create subset of the training dataset for debugging purposes
-    from torch.utils.data import Subset
-    train_dataset = Subset(train_dataset, range(min(128, len(train_dataset))))
-    val_dataset = Subset(val_dataset, range(min(128, len(val_dataset))))
     loader_args = {
         "batch_size": config["data"]["batch_size"],
         "num_workers": config["data"]["num_workers"],
         "pin_memory": config["data"]["pin_memory"],
         "collate_fn": collate_fn,
     }
+    if config["data"]["num_workers"] > 0:
+        loader_args["persistent_workers"] = True
+        loader_args["prefetch_factor"] = config["data"].get("prefetch_factor", 2)
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_args)
     val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
 
@@ -299,23 +349,38 @@ def main():
     for epoch in range(config["training"]["num_epochs"]):
         if warmup_freeze and epoch == config["model"].get("warmup_epochs", 0):
             model.set_encoder_trainable(True)
-        train_loss = run_epoch(
+        train_loss, train_metrics = run_epoch(
             model, criterion, train_loader, optimizer, tokenizer, config, device, True
         )
         with torch.no_grad():
-            val_loss = run_epoch(
+            val_loss, val_metrics = run_epoch(
                 model, criterion, val_loader, optimizer, tokenizer, config, device, False
             )
         scheduler.step()
-        logger.info(f"Epoch {epoch + 1}: train_loss={train_loss:.5f}, val_loss={val_loss:.5f}")
+        logger.info(
+            f"Epoch {epoch + 1}: train_loss={train_loss:.5f}, "
+            f"val_loss={val_loss:.5f}, "
+            f"val_mIoU={val_metrics['mean_iou']:.4f}, "
+            f"val_R@0.5={val_metrics['recall_iou_0.5']:.4f}"
+        )
         tb_logger.log_training_metrics(
-            epoch + 1, train_loss, {"val_loss": val_loss}, optimizer.param_groups[0]["lr"]
+            epoch + 1,
+            train_loss,
+            {"val_loss": val_loss, **train_metrics, **{
+                f"val_{name}": value for name, value in val_metrics.items()
+            }},
+            optimizer.param_groups[0]["lr"],
         )
         state = create_training_state_dict(
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
-            additional_state={"train_loss": train_loss, "val_loss": val_loss},
+            additional_state={
+                "train_loss": train_loss,
+                "val_loss": val_loss,
+                "train_metrics": train_metrics,
+                "val_metrics": val_metrics,
+            },
         )
         if val_loss < best_loss:
             best_loss = val_loss
