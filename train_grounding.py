@@ -53,6 +53,15 @@ def load_4d_encoder(config, device):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         state = checkpoint.get("state_dict", checkpoint)
         state = state.get("model_state_dict", state.get("model", state))
+        
+        
+        # --- ADD THIS BLOCK --- Fix this later
+        # Map 'fc_norm' from the 'avg' pretrained checkpoint to 'norm' expected by 'all' mode
+        if "motion_encoder.model.fc_norm.weight" in state:
+            state["motion_encoder.model.norm.weight"] = state.pop("motion_encoder.model.fc_norm.weight")
+            state["motion_encoder.model.norm.bias"] = state.pop("motion_encoder.model.fc_norm.bias")
+        # ----------------------
+        
         missing, unexpected = encoder.load_state_dict(state, strict=False)
         if missing or unexpected:
             raise RuntimeError(
@@ -80,6 +89,17 @@ def build_grounding_model(config, device):
             "Set model.grounding.encoder_output_dim when the configured "
             "4D encoder output dimension cannot be inferred."
         )
+    data_config = config["data"]
+    encoder_frames = data_config.get("sampled_frames", 160)
+    if "dataset_config_path" in data_config:
+        dataset_config = ConfigManager.load_config(data_config["dataset_config_path"])
+        encoder_frames = dataset_config.get("sampled_frames", encoder_frames)
+    if hasattr(encoder, "output_tokens_for_frames"):
+        qd_args_video_tokens = encoder.output_tokens_for_frames(encoder_frames)
+    else:
+        qd_args_video_tokens = grounding_config.get("max_v_l")
+    if qd_args_video_tokens is None:
+        raise ValueError("Unable to determine the grounding video token count.")
     text_model_name = grounding_config["text_model_name"]
     text_encoder = GroundingTextEncoder(
         text_model_name, trainable=not grounding_config["freeze_text_encoder"]
@@ -112,9 +132,13 @@ def build_grounding_model(config, device):
             "a_feat_dir": None,
             "t_feat_dim": text_encoder.text_model.config.hidden_size,
             "v_feat_dim": encoder_dim,
+            "max_v_l": qd_args_video_tokens,
             "aux_loss": grounding_config.get("aux_loss", True),
         }
     )
+    # QD-DETR's transformer builder expects this CLI-style option even when
+    # the grounding YAML omits it.
+    qd_args.setdefault("pre_norm", False)
     grounding_head, criterion = build_model(namespace_from_config(qd_args))
     model = FourDGroundingModel(encoder, grounding_head, text_encoder).to(device)
     return model, criterion, AutoTokenizer.from_pretrained(text_model_name)
@@ -122,39 +146,35 @@ def build_grounding_model(config, device):
 
 def build_dataset(config, split):
     data_config = config["data"]
-    dataset_config_path = data_config.get("dataset_config_path")
-    if dataset_config_path:
-        dataset_config = ConfigManager.load_config(dataset_config_path)
-        dataset_config["split"] = split
-        dataset_config["stitched_json_path"] = dataset_config[
-            "train_json" if split == "train" else "test_json"
-        ]
-        module = importlib.import_module(data_config["dataset_module"])
-        dataset_class = getattr(module, data_config["dataset_class"])
-        collate_fn = getattr(module, data_config["collate_fn"])
-        return dataset_class(dataset_config), collate_fn
-
+    
+    # Import class and collate function
     module = importlib.import_module(data_config["dataset_module"])
     dataset_class = getattr(module, data_config["dataset_class"])
     collate_fn = getattr(module, data_config["collate_fn"])
-    dataset_kwargs = {
-        key: value
-        for key, value in data_config.items()
-        if key not in {"dataset_module", "dataset_class", "collate_fn", "train_split",
-                       "val_split", "sequence_config"}
-    }
-    dataset_kwargs["split"] = split
-    dataset_kwargs["seed"] = data_config["sequence_config"]["seed"]
-    accepted = inspect.signature(dataset_class).parameters
-    dataset_kwargs = {
-        key: value for key, value in dataset_kwargs.items()
-        if key in accepted or any(
-            parameter.kind == inspect.Parameter.VAR_KEYWORD
-            for parameter in accepted.values()
-        )
-    }
-    return dataset_class(**dataset_kwargs), collate_fn
 
+    # If external path is provided, load it; otherwise extract from data_config
+    dataset_config_path = data_config.get("dataset_config_path")
+    if dataset_config_path:
+        dataset_config = ConfigManager.load_config(dataset_config_path)
+    else:
+        # Filter out dataloader-specific arguments
+        excluded_keys = {
+            "dataset_module", "dataset_class", "collate_fn", 
+            "train_split", "val_split", "batch_size", 
+            "num_workers", "pin_memory", "sequence_config"
+        }
+        dataset_config = {k: v for k, v in data_config.items() if k not in excluded_keys}
+        
+        # Inject seed if available
+        if "sequence_config" in data_config and "seed" in data_config["sequence_config"]:
+            dataset_config["seed"] = data_config["sequence_config"]["seed"]
+
+    # Assign split and route the correct JSON file path
+    dataset_config["split"] = split
+    dataset_config["stitched_json_path"] = dataset_config["train_json"] if split == "train" else dataset_config["test_json"]
+
+    # Pass the compiled dictionary to the dataset constructor
+    return dataset_class(dataset_config), collate_fn
 
 def make_optimizer(model, config):
     opt_config = config["training"]["optimizer"]
@@ -232,7 +252,7 @@ def run_epoch(model, criterion, loader, optimizer, tokenizer, config, device, tr
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="configs/grounding_config.yaml")
+    parser.add_argument("-c","--config", default="configs/grounding_config.yaml")
     args = parser.parse_args()
     config = ConfigManager.load_config(args.config)
     device = torch.device(config["model"].get("device", "cuda"))

@@ -18,9 +18,10 @@ model:
     nheads: 8
     dropout: 0.1
     input_dropout: 0.1
+    pre_norm: false
     num_queries: 10
     max_q_l: 32
-    max_v_l: 160
+    max_v_l: null
     n_input_proj: 2
     position_embedding: "sine"
     span_loss_type: "l1"

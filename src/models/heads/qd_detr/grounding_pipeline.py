@@ -57,9 +57,18 @@ class FourDGroundingModel(nn.Module):
             )
         else:
             if video_padding_mask.shape[1] != video_tokens.shape[1]:
-                raise ValueError(
-                    "Video padding mask length must match the encoder token length."
-                )
+                expand_mask = getattr(self.encoder, "expand_padding_mask", None)
+                if expand_mask is None:
+                    raise ValueError(
+                        "Video padding mask length must match the encoder token "
+                        "length, and the encoder does not provide mask expansion."
+                    )
+                video_padding_mask = expand_mask(video_padding_mask)
+                if video_padding_mask.shape[1] != video_tokens.shape[1]:
+                    raise ValueError(
+                        "Expanded video padding mask length does not match the "
+                        "encoder token length."
+                    )
             video_mask = ~video_padding_mask.bool()
         return self.grounding_head(
             src_txt=text_tokens,
