@@ -212,6 +212,14 @@ def prepare_batch(batch, tokenizer, device, max_q_l):
         max_length=max_q_l,
         return_tensors="pt",
     )
+    
+    # QD-DETR expects a single dictionary where keys map to a list of target dicts for the batch
+    formatted_targets = {
+        "span_labels": [
+            {"spans": t["span_labels"][0]["spans"].to(device)} for t in targets
+        ]
+    }
+    
     return (
         {
             "motion": motion.to(device, non_blocking=True),
@@ -219,7 +227,7 @@ def prepare_batch(batch, tokenizer, device, max_q_l):
             "attention_mask": tokens["attention_mask"].to(device),
             "video_padding_mask": video_padding_mask.to(device, non_blocking=True),
         },
-        [{key: value for key, value in target.items()} for target in targets],
+        formatted_targets
     )
 
 
@@ -262,6 +270,11 @@ def main():
 
     train_dataset, collate_fn = build_dataset(config, config["data"]["train_split"])
     val_dataset, _ = build_dataset(config, config["data"]["val_split"])
+    
+    # create subset of the training dataset for debugging purposes
+    from torch.utils.data import Subset
+    train_dataset = Subset(train_dataset, range(min(128, len(train_dataset))))
+    val_dataset = Subset(val_dataset, range(min(128, len(val_dataset))))
     loader_args = {
         "batch_size": config["data"]["batch_size"],
         "num_workers": config["data"]["num_workers"],

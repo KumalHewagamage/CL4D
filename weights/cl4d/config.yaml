@@ -1,0 +1,109 @@
+checkpointing:
+  max_checkpoints: 10
+  save_best: true
+  save_every_n_epochs: 10
+  save_last: true
+data:
+  batch_size: 72
+  data_root: data/v4.3-wall-humanML3d-2136
+  num_frames: 32
+  num_points: 2048
+  num_workers: 24
+  pin_memory: true
+  sequence_config:
+    center_sampling_strategy: middle
+    ensure_full_sequence: true
+    frame_interval: 5
+    max_points: null
+    normalize_coords: true
+    seed: 42
+  train_split: train
+  val_split: val
+experiment:
+  description: MoPa pipeline with PointNet + ViT motion encoder and CLIP loss
+  name: HumanML_MoPa_32_frames_72batch
+  tags:
+  - 4d
+  - text_grounding
+  - mopa
+  - pointnet
+  - contrastive
+logging:
+  console_level: INFO
+  file_level: DEBUG
+  log_level: INFO
+  tensorboard_flush_secs: 60
+model:
+  pipeline_args:
+    device: cuda
+    dropout: 0.5
+    motion_embedding_dims: 768
+    motion_encoder_alias: vit_base_patch16_224_in21k
+    motion_encoder_pretrained: true
+    motion_encoder_trainable: true
+    num_frames: 32
+    num_groups: 64
+    patch_size: 16
+    point_encoder_config:
+      dvae_config:
+        ckpt: weights/dVAE.pth
+        encoder_dim: 256
+        encoder_out: 512
+        freeze_encoder: true
+        group_size: 32
+        num_group: 64
+      transformer_config:
+        attn_drop_rate: 0.0
+        depth: 4
+        drop_path_rate: 0.1
+        drop_rate: 0.0
+        embed_dim: 768
+        mlp_ratio: 4.0
+        num_heads: 12
+        qk_scale: null
+        qkv_bias: false
+    projection_dims: 256
+  pipeline_class: PipelineMoPa
+  pipeline_module: src.models.pipelines.mopa_pipeline
+  text_encoder_config:
+    dropout: 0.5
+    freeze_text_encoder: false
+    projection_dims: 256
+    text_embedding_dims: 768
+    text_encoder_type: distilbert
+    text_model_name: distilbert-base-uncased
+paths:
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  output_dir: output/HumanML
+  tensorboard_dir: tensorboard
+resume:
+  checkpoint_path: null
+  enabled: false
+  resume_best: false
+  resume_last: false
+training:
+  accumulate_gradients: 1
+  gradient_clipping: 1.0
+  loss:
+    logit_scale: 0.07
+    type: clip_contrastive
+  mixed_precision: false
+  num_epochs: 150
+  optimizer:
+    betas:
+    - 0.9
+    - 0.999
+    eps: 1.0e-08
+    head_lr: 0.0001
+    motion_lr: 0.0001
+    text_lr: 1.0e-05
+    type: adamw
+    weight_decay: 0.0001
+  scheduler:
+    eta_min: 1.0e-06
+    type: cosine
+  validation:
+    every_n_epochs: 1
+    metric: loss
+    mode: min
