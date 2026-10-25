@@ -41,6 +41,7 @@ class FourDGroundingModel(nn.Module):
         motion: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        video_padding_mask: torch.Tensor = None,
     ):
         if not hasattr(self.encoder, "encode_motion"):
             raise AttributeError(
@@ -48,9 +49,16 @@ class FourDGroundingModel(nn.Module):
             )
         video_tokens = self.encoder.encode_motion(motion)
         text_tokens = self.text_encoder(input_ids, attention_mask)
-        video_mask = torch.ones(
-            video_tokens.shape[:2], dtype=torch.bool, device=video_tokens.device
-        )
+        if video_padding_mask is None:
+            video_mask = torch.ones(
+                video_tokens.shape[:2], dtype=torch.bool, device=video_tokens.device
+            )
+        else:
+            if video_padding_mask.shape[1] != video_tokens.shape[1]:
+                raise ValueError(
+                    "Video padding mask length must match the encoder token length."
+                )
+            video_mask = ~video_padding_mask.bool()
         return self.grounding_head(
             src_txt=text_tokens,
             src_txt_mask=attention_mask.bool(),

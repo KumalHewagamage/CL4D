@@ -18,7 +18,7 @@ project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root / "src/models/heads"))
 
 from src.models.heads.qd_detr.model import build_model
-from models.heads.qd_detr.grounding_pipeline import (
+from src.models.heads.qd_detr.grounding_pipeline import (
     FourDGroundingModel,
     GroundingTextEncoder,
 )
@@ -41,6 +41,11 @@ def load_4d_encoder(config, device):
     encoder_args = dict(pipeline_config.get("pipeline_args", {}))
     if "feature_mode" in inspect.signature(encoder_class).parameters:
         encoder_args["feature_mode"] = "all"
+    wrapper_module_name = config["model"].get("encoder_wrapper_module")
+    wrapper_class_name = config["model"].get("encoder_wrapper_class")
+    if wrapper_module_name and wrapper_class_name:
+        wrapper_module = importlib.import_module(wrapper_module_name)
+        encoder_class = getattr(wrapper_module, wrapper_class_name)
     encoder = encoder_class(**encoder_args).to(device)
 
     checkpoint_path = config["model"].get("encoder_checkpoint_path")
@@ -98,6 +103,18 @@ def build_grounding_model(config, device):
 
 def build_dataset(config, split):
     data_config = config["data"]
+    dataset_config_path = data_config.get("dataset_config_path")
+    if dataset_config_path:
+        dataset_config = ConfigManager.load_config(dataset_config_path)
+        dataset_config["split"] = split
+        dataset_config["stitched_json_path"] = dataset_config[
+            "train_json" if split == "train" else "test_json"
+        ]
+        module = importlib.import_module(data_config["dataset_module"])
+        dataset_class = getattr(module, data_config["dataset_class"])
+        collate_fn = getattr(module, data_config["collate_fn"])
+        return dataset_class(dataset_config), collate_fn
+
     module = importlib.import_module(data_config["dataset_module"])
     dataset_class = getattr(module, data_config["dataset_class"])
     collate_fn = getattr(module, data_config["collate_fn"])
@@ -148,24 +165,22 @@ def make_optimizer(model, config):
 
 
 def prepare_batch(batch, tokenizer, device, max_q_l):
+    motion, queries, targets, video_padding_mask = batch
     tokens = tokenizer(
-        batch["queries"],
+        queries,
         padding=True,
         truncation=True,
         max_length=max_q_l,
         return_tensors="pt",
     )
-    targets = [
-        {"span_labels": [{"spans": span.to(device).reshape(-1, 2)}]}
-        for span in batch["spans"]
-    ]
     return (
         {
-            "motion": batch["motion"].to(device, non_blocking=True),
+            "motion": motion.to(device, non_blocking=True),
             "input_ids": tokens["input_ids"].to(device),
             "attention_mask": tokens["attention_mask"].to(device),
+            "video_padding_mask": video_padding_mask.to(device, non_blocking=True),
         },
-        targets,
+        [{key: value for key, value in target.items()} for target in targets],
     )
 
 

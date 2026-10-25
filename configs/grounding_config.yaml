@@ -5,6 +5,8 @@ experiment:
 model:
   encoder_config_path: "configs/DynAction4D_Human/cl4d_config.yaml"
   encoder_checkpoint_path: null
+  encoder_wrapper_module: "src.models.pipelines.cl4d_module.cl4d_pipeline_grounding"
+  encoder_wrapper_class: "CL4DGrounding"
   grounding:
     text_model_name: "distilbert-base-uncased"
     freeze_text_encoder: false
@@ -17,7 +19,7 @@ model:
     input_dropout: 0.1
     num_queries: 10
     max_q_l: 32
-    max_v_l: 197
+    max_v_l: 160
     n_input_proj: 2
     position_embedding: "sine"
     span_loss_type: "l1"
@@ -41,16 +43,12 @@ model:
   warmup_epochs: 0
 
 data:
-  dataset_module: "src.datasets.temporal_grounding_dummy"
-  dataset_class: "DummyTemporalGroundingDataset"
-  collate_fn: "collate_fn"
+  dataset_config_path: "configs/stiched_data.yaml"
+  dataset_module: "src.datasets.stitched_dataset"
+  dataset_class: "StitchedDynAction4D"
+  collate_fn: "grounding_collate_fn"
   train_split: "train"
   val_split: "val"
-  data_root: "data"
-  size: 16
-  num_frames: 32
-  num_points: 2048
-  sequence_features: 9
   batch_size: 2
   num_workers: 0
   pin_memory: true
