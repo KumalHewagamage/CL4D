@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from transformers import AutoModel
+from transformers import AutoConfig, AutoModel
 
 
 class GroundingTextEncoder(nn.Module):
@@ -8,12 +8,14 @@ class GroundingTextEncoder(nn.Module):
 
     def __init__(self, model_name: str, trainable: bool = True):
         super().__init__()
-        self.model = AutoModel.from_pretrained(model_name)
-        for parameter in self.model.parameters():
+        # Keep the same module name as the encoder training TextEncoder so its
+        # text_encoder_state_dict can be loaded without key translation.
+        self.text_model = AutoModel.from_config(AutoConfig.from_pretrained(model_name))
+        for parameter in self.text_model.parameters():
             parameter.requires_grad = trainable
 
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        return self.model(
+        return self.text_model(
             input_ids=input_ids, attention_mask=attention_mask
         ).last_hidden_state
 

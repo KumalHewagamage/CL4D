@@ -59,12 +59,12 @@ def load_4d_encoder(config, device):
                 f"4D encoder checkpoint mismatch: missing={missing}, "
                 f"unexpected={unexpected}"
             )
-    return encoder, encoder_config
+    return encoder, encoder_config, checkpoint if checkpoint_path else None
 
 
 def build_grounding_model(config, device):
     grounding_config = config["model"]["grounding"]
-    encoder, encoder_config = load_4d_encoder(config, device)
+    encoder, encoder_config, encoder_checkpoint = load_4d_encoder(config, device)
     encoder_args = encoder_config["model"].get("pipeline_args", {})
     encoder_dim = grounding_config.get("encoder_output_dim")
     for key in ("output_dim", "feature_dim", "embedding_dim", "motion_embedding_dims"):
@@ -84,6 +84,25 @@ def build_grounding_model(config, device):
     text_encoder = GroundingTextEncoder(
         text_model_name, trainable=not grounding_config["freeze_text_encoder"]
     )
+    if grounding_config.get("load_text_encoder_from_checkpoint", True):
+        if encoder_checkpoint is None:
+            raise ValueError(
+                "load_text_encoder_from_checkpoint is enabled, but "
+                "encoder_checkpoint_path is not configured."
+            )
+        checkpoint_state = encoder_checkpoint.get("state_dict", encoder_checkpoint)
+        text_state = checkpoint_state.get("text_encoder_state_dict")
+        if text_state is None:
+            raise KeyError(
+                "The encoder checkpoint does not contain "
+                "'state_dict.text_encoder_state_dict'."
+            )
+        missing, unexpected = text_encoder.load_state_dict(text_state, strict=False)
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Text encoder checkpoint mismatch: missing={missing}, "
+                f"unexpected={unexpected}"
+            )
 
     qd_args = dict(grounding_config)
     qd_args.update(
@@ -91,7 +110,7 @@ def build_grounding_model(config, device):
             "device": str(device),
             "dset_name": "hl",
             "a_feat_dir": None,
-            "t_feat_dim": text_encoder.model.config.hidden_size,
+            "t_feat_dim": text_encoder.text_model.config.hidden_size,
             "v_feat_dim": encoder_dim,
             "aux_loss": grounding_config.get("aux_loss", True),
         }

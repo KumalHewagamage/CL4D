@@ -4,11 +4,12 @@ experiment:
 
 model:
   encoder_config_path: "configs/DynAction4D_Human/cl4d_config.yaml"
-  encoder_checkpoint_path: null
+  encoder_checkpoint_path: "weights/cl4d/best.pth"
   encoder_wrapper_module: "src.models.pipelines.cl4d_module.cl4d_pipeline_grounding"
   encoder_wrapper_class: "CL4DGrounding"
   grounding:
     text_model_name: "distilbert-base-uncased"
+    load_text_encoder_from_checkpoint: true
     freeze_text_encoder: false
     hidden_dim: 256
     enc_layers: 2
