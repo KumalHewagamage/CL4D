@@ -753,6 +753,7 @@ class Trainer:
 def main():
     parser = argparse.ArgumentParser(description="Train 4D Text Alignment Pipeline")
     parser.add_argument(
+        "-c",
         "--config",
         type=str,
         default="configs/DynAction4D_Human/cl4d_config.yaml",

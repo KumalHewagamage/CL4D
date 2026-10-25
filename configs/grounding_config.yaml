@@ -1,0 +1,95 @@
+experiment:
+  name: "CL4D_temporal_grounding"
+  description: "Temporal grounding with a QD-DETR head on 4D encoder tokens"
+
+model:
+  encoder_config_path: "configs/DynAction4D_Human/cl4d_config.yaml"
+  encoder_checkpoint_path: null
+  grounding:
+    text_model_name: "distilbert-base-uncased"
+    freeze_text_encoder: false
+    hidden_dim: 256
+    enc_layers: 2
+    dec_layers: 2
+    dim_feedforward: 1024
+    nheads: 8
+    dropout: 0.1
+    input_dropout: 0.1
+    num_queries: 10
+    max_q_l: 32
+    max_v_l: 197
+    n_input_proj: 2
+    position_embedding: "sine"
+    span_loss_type: "l1"
+    aux_loss: true
+    use_txt_pos: false
+    set_cost_class: 1.0
+    set_cost_span: 1.0
+    set_cost_giou: 1.0
+    span_loss_coef: 10.0
+    giou_loss_coef: 1.0
+    label_loss_coef: 4.0
+    eos_coef: 0.1
+    contrastive_align_loss: false
+    contrastive_hdim: 64
+    contrastive_align_loss_coef: 1.0
+    temperature: 0.07
+    lw_saliency: 0.0
+    saliency_margin: 0.2
+  freeze_encoder: false
+  freeze_encoder_during_warmup: false
+  warmup_epochs: 0
+
+data:
+  dataset_module: "src.datasets.temporal_grounding_dummy"
+  dataset_class: "DummyTemporalGroundingDataset"
+  collate_fn: "collate_fn"
+  train_split: "train"
+  val_split: "val"
+  data_root: "data"
+  size: 16
+  num_frames: 32
+  num_points: 2048
+  sequence_features: 9
+  batch_size: 2
+  num_workers: 0
+  pin_memory: true
+  sequence_config:
+    seed: 42
+
+training:
+  num_epochs: 10
+  optimizer:
+    type: "adamw"
+    encoder_lr: 1.0e-5
+    grounding_lr: 1.0e-4
+    text_lr: 1.0e-5
+    weight_decay: 1.0e-4
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  scheduler:
+    type: "cosine"
+    eta_min: 1.0e-6
+  gradient_clipping: 1.0
+  validation:
+    every_n_epochs: 1
+    metric: "loss"
+    mode: "min"
+
+checkpointing:
+  save_best: true
+  save_last: true
+  save_every_n_epochs: 1
+  max_checkpoints: 5
+
+logging:
+  log_level: "INFO"
+  console_level: "INFO"
+  file_level: "DEBUG"
+  tensorboard_flush_secs: 60
+
+paths:
+  output_dir: "output/grounding"
+  checkpoint_dir: "checkpoints"
+  log_dir: "logs"
+  tensorboard_dir: "tensorboard"
