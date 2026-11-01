@@ -1,19 +1,21 @@
+import os
 import json
 import logging
 import random
-from collections import OrderedDict
-import math
 import numpy as np
 import torch
 from pathlib import Path
 from typing import Dict, List, Tuple
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
 class StitchedDynAction4D(torch.utils.data.Dataset):
     """
-    4D Temporal Grounding Dataset utilizing flattened indices for deterministic evaluation,
-    X-Z root translation for stitching, and chunked normalization.
+    4D Temporal Grounding Dataset with Fully Precomputed Disk Caching.
+    All processing (stitching, striding, normalization, masking, and target formatting)
+    is done upfront. `__getitem__` only performs a fast torch.load().
     """
     def __init__(self, config: dict):
         self.data_root = Path(config["data_root"])
@@ -28,54 +30,86 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
         self.no_normalize = config.get("no_normalize", False)
         self.augment = config.get("augment", False)
         self.seed = config.get("seed", 42)
-        self.sequence_cache_size = config.get("sequence_cache_size", 1)
-        self._sequence_cache = OrderedDict()
+        
+        # Disk Caching Setup
+        self.cache_dir = Path(str(self.data_root) + f"_{self.split}_cache_v2")
+        self._verify_or_init_disk_cache(config)
         
         random.seed(self.seed)
         np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        
+        # Parse JSON and build the unique sequences and flattened index
+        with open(self.json_path, 'r') as f:
+            self.stitched_data = json.load(f)
+            
+        # Debugging: Limit dataset size for faster iteration (remove/comment out in production)
+            
+        # self.stitched_data = dict(list(self.stitched_data.items())[:256])
         self.samples = self._build_flattened_index()
         logger.info(f"Dataset initialized with {len(self.samples)} query-video pairs.")
+        
+        # FORCE PARALLEL UPFRONT CACHING BEFORE TRAINING STARTS
+        self._precompute_cache_parallel()
+
+    def _verify_or_init_disk_cache(self, current_config: dict):
+        cache_meta_path = self.cache_dir / "cache_config.json"
+        
+        # Now including all parameters that affect the final tensor and targets
+        critical_keys = [
+            "stitched_json_path", "target_raw_frames", "sampled_frames", 
+            "stride", "num_points", "num_features", "window_size", "no_normalize"
+        ]
+        cache_config_subset = {k: current_config.get(k) for k in critical_keys}
+
+        if self.cache_dir.exists() and cache_meta_path.exists():
+            with open(cache_meta_path, 'r') as f:
+                saved_config = json.load(f)
+            
+            if saved_config != cache_config_subset:
+                raise ValueError(
+                    f"\n[CACHE CONFIG MISMATCH DETECTED]\n"
+                    f"Saved Config: {saved_config}\n"
+                    f"Current Config: {cache_config_subset}\n"
+                    f"Action Required: Delete the cache directory at '{self.cache_dir}' and rerun."
+                )
+            logger.info(f"Valid fully-processed disk cache found at {self.cache_dir}")
+        else:
+            logger.info(f"Initializing new fully-processed disk cache at {self.cache_dir}")
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(cache_meta_path, 'w') as f:
+                json.dump(cache_config_subset, f, indent=4)
 
     def _build_flattened_index(self) -> List[Dict]:
-        """
-        Flattens the dataset so each specific action query is an independent sample.
-        This prevents center-bias and ensures deterministic evaluation.
-        """
-        with open(self.json_path, 'r') as f:
-            stitched_data = json.load(f)
-
         flattened_samples = []
-        for stitched_id, seq_meta in stitched_data.items():
+        for stitched_id, seq_meta in self.stitched_data.items():
             for action_idx, action_meta in enumerate(seq_meta["actions"]):
-                # Skip actions with unknown captions or pure backgrounds if desired
                 if action_meta["caption"] == "unknown action":
                     continue
-                    
                 flattened_samples.append({
                     "stitched_id": stitched_id,
-                    "seq_meta": seq_meta,
                     "target_action_idx": action_idx
                 })
         return flattened_samples
+
+    # =========================================================================
+    # WORKER FUNCTIONS (Used only during initialization)
+    # =========================================================================
 
     def _load_pcd(self, pcd_path: str) -> np.ndarray:
         points = []
         try:
             with open(pcd_path, 'r') as f:
                 lines = f.readlines()
-            
             header_end = 0
             for i, line in enumerate(lines):
                 if line.startswith('DATA ascii'):
                     header_end = i + 1
                     break
-                    
             for line in lines[header_end:]:
                 parts = line.strip().split()
                 if len(parts) < 3: continue
-                
                 points.append([float(parts[0]), float(parts[1]), float(parts[2])])
-                
             pts = np.array(points, dtype=np.float32)
             if len(pts) == 0:
                 return np.zeros((0, self.num_features), dtype=np.float32)
@@ -94,14 +128,30 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
             np.zeros((T - N, self.num_features), dtype=np.float32)
         ], axis=0)
 
-    def _load_and_stitch_frames(self, actions: List[Dict]) -> np.ndarray:
-        """Loads physical frames and aligns their roots (X, Z) sequentially."""
+    def _chunked_normalization(self, seq_data: np.ndarray) -> np.ndarray:
+        T = seq_data.shape[0]
+        out_data = np.copy(seq_data)
+        for start_idx in range(0, T, self.window_size):
+            end_idx = min(start_idx + self.window_size, T)
+            window_xyz = seq_data[start_idx:end_idx, :, 0:3]
+            min_xyz = np.min(window_xyz, axis=(0, 1), keepdims=True)
+            max_xyz = np.max(window_xyz, axis=(0, 1), keepdims=True)
+            range_xyz = max_xyz - min_xyz
+            range_xyz[range_xyz == 0] = 1.0 
+            out_data[start_idx:end_idx, :, 0:3] = (window_xyz - min_xyz) / range_xyz
+        return out_data
+
+    def _cache_single_stitched_video(self, stitched_id: str, seq_meta: dict) -> str:
+        """Fully processes a stitched video, computes all targets, and saves a .pt dictionary."""
+        disk_cache_path = self.cache_dir / f"{stitched_id}.pt"
+        if disk_cache_path.exists():
+            return stitched_id
+
+        # 1. Load and Stitch Raw Physical Frames
         stitched_frames = []
         prev_end_frame_xz = None
-
-        for action in actions:
+        for action in seq_meta["actions"]:
             seq_dir = Path(action["sequence_path"])
-            # Load frames based on the original length allocated in the JSON
             frame_files = sorted(list(seq_dir.glob('frame_*.pcd')))[:action["original_length"]]
             
             action_frames = []
@@ -113,124 +163,120 @@ class StitchedDynAction4D(torch.utils.data.Dataset):
             if not action_frames:
                 continue
                 
-            action_tensor = np.stack(action_frames, axis=0)  # [L, N, 9]
-
-            # X-Z Root Translation to match the end of the previous sequence
+            action_tensor = np.stack(action_frames, axis=0)
             if prev_end_frame_xz is not None:
                 curr_start_xz = np.mean(action_tensor[0, :, [0, 2]], axis=0)
                 offset = prev_end_frame_xz - curr_start_xz
-                action_tensor[:, :, 0] += offset[0]  # Shift X
-                action_tensor[:, :, 2] += offset[1]  # Shift Z
+                action_tensor[:, :, 0] += offset[0]
+                action_tensor[:, :, 2] += offset[1]
 
             stitched_frames.append(action_tensor)
-            
-            # Store the final frame's XZ mean for the next sequence's alignment
             prev_end_frame_xz = np.mean(action_tensor[-1, :, [0, 2]], axis=0)
 
-        # Concatenate all shifted sequences
         if stitched_frames:
             full_sequence = np.concatenate(stitched_frames, axis=0)
         else:
-            full_sequence = np.zeros(
-                (1, self.num_points, self.num_features), dtype=np.float32
-            )
+            full_sequence = np.zeros((1, self.num_points, self.num_features), dtype=np.float32)
             
-        # Pad by repeating the last frame if it falls short of the target raw frames
         current_len = full_sequence.shape[0]
         if current_len < self.target_raw_frames:
             padding = np.repeat(full_sequence[-1:], self.target_raw_frames - current_len, axis=0)
             full_sequence = np.concatenate([full_sequence, padding], axis=0)
-            
-        return full_sequence[:self.target_raw_frames]
-
-    def _get_stitched_sequence(self, sample):
-        stitched_id = sample["stitched_id"]
-        cached = self._sequence_cache.get(stitched_id)
-        if cached is not None:
-            self._sequence_cache.move_to_end(stitched_id)
-            return cached
-        sequence = self._load_and_stitch_frames(sample["seq_meta"]["actions"])
-        if self.sequence_cache_size > 0:
-            self._sequence_cache[stitched_id] = sequence
-            self._sequence_cache.move_to_end(stitched_id)
-            while len(self._sequence_cache) > self.sequence_cache_size:
-                self._sequence_cache.popitem(last=False)
-        return sequence
-
-    def _chunked_normalization(self, seq_data: np.ndarray) -> np.ndarray:
-        """Normalizes spatial coordinates strictly within 32-frame blocks."""
-        T = seq_data.shape[0]
-        out_data = np.copy(seq_data)
         
-        for start_idx in range(0, T, self.window_size):
-            end_idx = min(start_idx + self.window_size, T)
-            window_xyz = seq_data[start_idx:end_idx, :, 0:3]
+        raw_sequence = full_sequence[:self.target_raw_frames]
+
+        # 2. Stride and Normalize
+        sampled_sequence = raw_sequence[::self.stride][:self.sampled_frames]
+        if not self.no_normalize:
+            sampled_sequence = self._chunked_normalization(sampled_sequence)
+        seq_tensor = torch.from_numpy(sampled_sequence)
+        vid_mask = torch.zeros(self.sampled_frames, dtype=torch.bool)
+
+        # 3. Precompute all Target Dicts for this sequence
+        processed_actions = []
+        for action in seq_meta["actions"]:
+            strided_start = action["start_frame"] / self.stride
+            strided_end = action["end_frame"] / self.stride
             
-            min_xyz = np.min(window_xyz, axis=(0, 1), keepdims=True)
-            max_xyz = np.max(window_xyz, axis=(0, 1), keepdims=True)
-            range_xyz = max_xyz - min_xyz
-            range_xyz[range_xyz == 0] = 1.0 
+            center_x = (strided_start + strided_end) / 2.0 / self.sampled_frames
+            width = (strided_end - strided_start) / self.sampled_frames
             
-            out_data[start_idx:end_idx, :, 0:3] = (window_xyz - min_xyz) / range_xyz
+            center_x = max(0.0, min(1.0, float(center_x)))
+            width = max(0.0, min(1.0, float(width)))
+
+            target_dict = {
+                "span_labels": [{
+                    "spans": torch.tensor([[center_x, width]], dtype=torch.float32)
+                }]
+            }
+            processed_actions.append({
+                "caption": action["caption"],
+                "target_dict": target_dict
+            })
+
+        # 4. Save Final Payload
+        payload = {
+            "seq_tensor": seq_tensor,
+            "vid_mask": vid_mask,
+            "actions": processed_actions
+        }
+        
+        temp_path = disk_cache_path.with_suffix('.tmp.pt')
+        torch.save(payload, temp_path)
+        temp_path.rename(disk_cache_path)
+        return stitched_id
+
+    def _precompute_cache_parallel(self):
+        missing_ids = [
+            s_id for s_id in self.stitched_data.keys() 
+            if not (self.cache_dir / f"{s_id}.pt").exists()
+        ]
+        
+        if not missing_ids:
+            logger.info(f"All {len(self.stitched_data)} sequences already cached for '{self.split}'.")
+            return
             
-        return out_data
+        num_workers = 24
+        logger.info(f"Pre-computing {len(missing_ids)} missing sequences using {num_workers} workers.")
+        
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = {
+                executor.submit(self._cache_single_stitched_video, s_id, self.stitched_data[s_id]): s_id 
+                for s_id in missing_ids
+            }
+            for future in tqdm(as_completed(futures), total=len(futures), desc=f"Caching {self.split}"):
+                try:
+                    future.result()
+                except Exception as e:
+                    failed_id = futures[future]
+                    logger.error(f"Failed to cache sequence {failed_id}: {e}")
+
+    # =========================================================================
+    # FAST DATA LOADER EXECUTION
+    # =========================================================================
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, str, Dict, torch.Tensor]:
         sample = self.samples[idx]
-        seq_meta = sample["seq_meta"]
-        target_action = seq_meta["actions"][sample["target_action_idx"]]
-        caption = target_action["caption"]
+        stitched_id = sample["stitched_id"]
+        action_idx = sample["target_action_idx"]
         
-        # 1. Load, stitch, and pad raw frames [320, N, 9]
-        raw_sequence = self._get_stitched_sequence(sample)
+        # Load the fully processed payload
+        disk_cache_path = self.cache_dir / f"{stitched_id}.pt"
+        payload = torch.load(disk_cache_path, map_location="cpu", weights_only=True)
         
-        # 2. Strided temporal sampling [160, N, 9]
-        sampled_sequence = raw_sequence[::self.stride][:self.sampled_frames]
+        seq_tensor = payload["seq_tensor"]
+        vid_mask = payload["vid_mask"]
+        target_action = payload["actions"][action_idx]
         
-        # 3. Apply 32-frame chunked normalization
-        if not self.no_normalize:
-            sampled_sequence = self._chunked_normalization(sampled_sequence)
-            
-        seq_tensor = torch.from_numpy(sampled_sequence)
-        
-        # 4. Generate Ground Truth targets (Normalized Center/Width)
-        # Convert raw start/end to strided bounds
-        strided_start = target_action["start_frame"] / self.stride
-        strided_end = target_action["end_frame"] / self.stride
-        
-        # Normalize bounds relative to the final temporal size (160)
-        center_x = (strided_start + strided_end) / 2.0 / self.sampled_frames
-        width = (strided_end - strided_start) / self.sampled_frames
-        
-        # Ensure values are safely clamped between 0 and 1
-        center_x = max(0.0, min(1.0, float(center_x)))
-        width = max(0.0, min(1.0, float(width)))
-
-        # Format exactly as QD-DETR SetCriterion expects
-        target_dict = {
-            "span_labels": [{
-                "spans": torch.tensor([[center_x, width]], dtype=torch.float32)
-            }]
-        }
-        
-        # Video padding mask (False means it IS valid data, True means padding)
-        # For simplicity, if we guarantee it's always padded to exactly sampled_frames, 
-        # it is all valid.
-        vid_mask = torch.zeros(self.sampled_frames, dtype=torch.bool)
-        
-        return seq_tensor, caption, target_dict, vid_mask
+        return seq_tensor, target_action["caption"], target_action["target_dict"], vid_mask
 
     def __len__(self):
         return len(self.samples)
 
 
 def grounding_collate_fn(batch):
-    """
-    Collates the data specifically for the QD-DETR architecture input.
-    """
-    sequences = torch.stack([item[0] for item in batch], dim=0)  # [B, T, N, 9]
-    captions = [item[1] for item in batch]                       # List[str]
-    targets = [item[2] for item in batch]                        # List[Dict]
-    vid_masks = torch.stack([item[3] for item in batch], dim=0)  # [B, T]
-    
+    sequences = torch.stack([item[0] for item in batch], dim=0)
+    captions = [item[1] for item in batch]
+    targets = [item[2] for item in batch]
+    vid_masks = torch.stack([item[3] for item in batch], dim=0)
     return sequences, captions, targets, vid_masks

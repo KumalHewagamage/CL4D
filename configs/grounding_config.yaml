@@ -7,7 +7,6 @@ model:
   encoder_checkpoint_path: "weights/cl4d/best.pth"
   encoder_wrapper_module: "src.models.pipelines.cl4d_module.cl4d_pipeline_grounding"
   encoder_wrapper_class: "CL4DGrounding"
-  encoder_window_batch_size: 1
   grounding:
     text_model_name: "distilbert-base-uncased"
     load_text_encoder_from_checkpoint: true
@@ -52,12 +51,12 @@ data:
   collate_fn: "grounding_collate_fn"
   train_split: "train"
   val_split: "val"
-  batch_size: 4
+  batch_size: 8
   num_workers: 24
   pin_memory: true
   
   # Integrated dataset configuration
-  data_root: "/path/to/dynaction4d"
+  data_root: "data/DynAction4D_Human"
   train_json: "data/grounding_v1/stitched_train.json"
   test_json: "data/grounding_v1/stitched_test.json"
   target_raw_frames: 320

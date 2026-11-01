@@ -39,9 +39,7 @@ def load_4d_encoder(config, device):
     module = importlib.import_module(pipeline_config["pipeline_module"])
     encoder_class = getattr(module, pipeline_config["pipeline_class"])
     encoder_args = dict(pipeline_config.get("pipeline_args", {}))
-    encoder_args["window_batch_size"] = config["model"].get(
-        "encoder_window_batch_size", encoder_args.get("window_batch_size", 1)
-    )
+    
     if "feature_mode" in inspect.signature(encoder_class).parameters:
         encoder_args["feature_mode"] = "all"
     wrapper_module_name = config["model"].get("encoder_wrapper_module")
@@ -319,14 +317,18 @@ def main():
         config, config["experiment"]["name"]
     )
 
-    train_dataset, collate_fn = build_dataset(config, config["data"]["train_split"])
-    val_dataset, _ = build_dataset(config, config["data"]["val_split"])
+    train_dataset, collate_fn = build_dataset(config, config["data"]["train
+    # For debugging, you can use a smaller subset of the dataset
+    train_dataset = Subset(train_dataset, range(len(train_dataset) // 4))  # Use 25% of the training data
+    val_dataset = Subset(val_dataset, range(len(val_dataset) // 4))  # Use 25% of the validation data
     
     loader_args = {
         "batch_size": config["data"]["batch_size"],
         "num_workers": config["data"]["num_workers"],
         "pin_memory": config["data"]["pin_memory"],
-        "collate_fn": collate_fn,
+        "collate_fn": collate_fn,_split"])
+    val_dataset, _ = build_dataset(config, config["data"]["val_split"])
+    from torch.utils.data import Subset
     }
     if config["data"]["num_workers"] > 0:
         loader_args["persistent_workers"] = True
